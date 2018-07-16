@@ -80,6 +80,7 @@ enum Command {
 
 fn parse(input: &[u8]) -> Option<Command> {
     let s = String::from_utf8_lossy(input);
+    let s = s.split('\r').take(1).collect::<String>();
     let mut sp = s.split(' ');
     let cmd = sp.next()?;
     match cmd {
@@ -111,38 +112,40 @@ impl Client {
                 }
             };
 
-            let mut db = match self.db.lock() {
-                Ok(db) => db,
-                Err(_) => panic!("lock"),
+
+
+            if let Some(cmd) = parse(&buffer[..]) {
+                let mut db = match self.db.lock() {
+                    Ok(db) => db,
+                    Err(_) => panic!("lock"),
+                };
+
+                let mut response: Option<Value> = match cmd {
+                    Command::Create(key, val) => {
+                        db.create(key, val).map(|v| v.clone())
+                    },
+                    Command::Delete(key) => {
+                        db.delete(&key).map(|v| v.clone())
+                    },
+                    Command::Read(key) => {
+                        db.read(&key).map(|v| v.clone())
+                    },
+                    Command::Update(key, val) => {
+                        db.update(&key, val).map(|v| v.clone())
+                    }
+                };
+
+                drop(db);
+
+                match response {
+                    Some(mut r) => {
+                        r.push(b'\r');
+                        r.push(b'\n');
+                        self.stream.write(&r[..]).expect("Failed to write to stream!")
+                    },
+                    None => self.stream.write(b"Error\r\n").expect("Failed to write to stream!"),
+                };
             };
-
-            match buffer[0] as char {
-                'c' => {
-                    let key = parse(&buffer[1..5]);
-                    let val = parse(&buffer[5..]);
-                    let output = match db.create(key, val) {
-                        Some(exist) => self.stream.write(&exist).unwrap(),
-                        None => self.stream.write(b"new key\r\n").unwrap(),
-                    };
-                },
-                'r' => {
-                    match db.read(&parse(&buffer[1..])) {
-                        Some(val) => self.stream.write(&val).unwrap(),
-                        None => self.stream.write(b"no value\r\n").unwrap(),
-                    };
-                },
-                'u' => {
-
-                },
-                'd' => {
-
-                },
-                _ => {
-                    self.stream.write(b"unrecognized command\r\n").unwrap();
-                }
-            }
-
-            drop(db);
             buffer.clear();
 
         }
