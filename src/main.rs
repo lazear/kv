@@ -1,18 +1,23 @@
-use std::io;
-use std::io::prelude::*;
-use std::net::*;
-use std::sync::{Arc, Mutex, MutexGuard};
-use std::sync::mpsc::{Sender, Receiver, channel};
-use std::thread;
 use std::collections::HashMap;
+use std::io::prelude::*;
+use std::io::Read;
+use std::net::*;
+use std::str;
+use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::thread;
 
-type Key = Vec<u8>;
-type Value = Vec<u8>;
+mod lexer;
+mod parser;
+
+use parser::{Command, Command::*, Parser, Value, Value::*};
+
+type Key = String;
 
 struct Entry {
     value: Value,
     expiration: Option<usize>,
-    subscribers: Option<Vec<Sender<Value>>>,
+    subscribers: Option<Vec<Sender<Vec<u8>>>>,
 }
 
 struct Database {
@@ -27,29 +32,47 @@ impl Database {
     }
 
     pub fn create(&mut self, key: Key, value: Value) -> Option<Value> {
-        println!("create {:?}->{:?}", String::from_utf8_lossy(&key), String::from_utf8_lossy(&value) );
-        self.data.insert(key, Entry { value: value, expiration: None, subscribers: None}).map(|e| e.value)
+        println!("create {}->{}", key, &value);
+        self.data
+            .insert(
+                key,
+                Entry {
+                    value: value,
+                    expiration: None,
+                    subscribers: None,
+                },
+            ).map(|e| e.value)
     }
 
     pub fn read(&self, key: &Key) -> Option<&Value> {
-        println!("read {:?}", String::from_utf8_lossy(key));
+        println!("read {}", key,);
         self.data.get(key).map(|e| &e.value)
     }
 
-    pub fn update(&mut self, key: &Key, value: Value) -> Option<Value> {
+    pub fn update(
+        &mut self,
+        key: &Key,
+        value: Value,
+    ) -> Result<Option<Value>, Box<std::error::Error>> {
+        // println!(
+        //     "update {:?}->{:?}",
+        //     str::from_utf8(&key)?,
+        //     str::from_utf8(&value)?
+        // );
         if self.data.contains_key(key) {
             if let Some(exist) = self.data.get_mut(key) {
                 if let Some(ref subscribers) = exist.subscribers {
                     for sub in subscribers.iter() {
-                        sub.send(value.clone());
+                        let response = format!("update {}->{}\r\n\r\n", key, value);
+                        sub.send(Vec::from(response.as_bytes()))?;
                     }
                 }
-                Some(std::mem::replace(&mut exist.value, value))
+                Ok(Some(std::mem::replace(&mut exist.value, value)))
             } else {
-                None
-            }            
+                Ok(None)
+            }
         } else {
-            None
+            Ok(None)
         }
     }
 
@@ -57,38 +80,21 @@ impl Database {
         self.data.remove(key).map(|e| e.value)
     }
 
-    pub fn subscribe(&mut self, key: &Key, sender: Sender<Value>) -> usize {
+    pub fn subscribe(&mut self, key: &Key, sender: Sender<Vec<u8>>) -> usize {
+        let mut nsub = 0;
         if self.data.contains_key(key) {
             if let Some(exist) = self.data.get_mut(key) {
+                let response = format!("update {}->{}\r\n\r\n", key, &exist.value);
+                sender.send(Vec::from(response.as_bytes()));
                 if let Some(ref mut subs) = exist.subscribers {
                     subs.push(sender);
+                    nsub = subs.len();
                 } else {
                     exist.subscribers = Some(vec![sender]);
                 }
             }
         }
-        0
-    }
-}
-
-enum Command {
-    Create(Key, Value),
-    Read(Key),
-    Update(Key, Value),
-    Delete(Key),
-}
-
-fn parse(input: &[u8]) -> Option<Command> {
-    let s = String::from_utf8_lossy(input);
-    let s = s.split('\r').take(1).collect::<String>();
-    let mut sp = s.split(' ');
-    let cmd = sp.next()?;
-    match cmd {
-        "create" => Some(Command::Create(sp.next()?.as_bytes().into(), sp.next()?.as_bytes().into())),
-        "read" => Some(Command::Read(sp.next()?.as_bytes().into())),
-        "update" => Some(Command::Update(sp.next()?.as_bytes().into(), sp.next()?.as_bytes().into())),
-        "delete" => Some(Command::Delete(sp.next()?.as_bytes().into())),
-        _ => None
+        nsub
     }
 }
 
@@ -98,81 +104,140 @@ struct Client {
 }
 
 impl Client {
-    pub fn run(&mut self) {
-        let mut buffer: Vec<u8> = Vec::new();
-        
-        self.stream.write(b"connect to mq\r\n").unwrap();
-        loop {
-            buffer.extend(std::iter::repeat(0).take(16));
-            match self.stream.read(&mut buffer[0..]) {
-                Ok(r) => r,
-                Err(e) => {
-                    println!("error reading from stream {:#?}", self.stream.peer_addr());
+    pub fn spawn(stream: TcpStream, db: Arc<Mutex<Database>>) -> Self {
+        Client { stream, db }
+    }
+
+    pub fn run(mut self) {
+        println!("Client {} connected", self.stream.peer_addr().unwrap());
+
+        self.stream.write(b"connect to kv\r\n").unwrap();
+        self.stream.set_read_timeout(None).unwrap();
+
+        let (tx, rx) = channel::<Vec<u8>>();
+        let mut stream = self.stream.try_clone().unwrap();
+
+        // Spawn the writing stream
+        thread::spawn(move || {
+            loop {
+                if let Ok(message) = rx.recv() {
+                    stream.write(&message[..]);
+                } else {
                     break;
                 }
-            };
+            }
+            println!("Closing sender");
+        });
 
-
-
-            if let Some(cmd) = parse(&buffer[..]) {
-                let mut db = match self.db.lock() {
-                    Ok(db) => db,
-                    Err(_) => panic!("lock"),
-                };
-
-                let mut response: Option<Value> = match cmd {
-                    Command::Create(key, val) => {
-                        db.create(key, val).map(|v| v.clone())
-                    },
-                    Command::Delete(key) => {
-                        db.delete(&key).map(|v| v.clone())
-                    },
-                    Command::Read(key) => {
-                        db.read(&key).map(|v| v.clone())
-                    },
-                    Command::Update(key, val) => {
-                        db.update(&key, val).map(|v| v.clone())
+        // Spawn the reading stream
+        thread::spawn(move || {
+            let mut buffer = [0u8; 1024];
+            'outer: loop {
+                let read_bytes = match self.stream.read(&mut buffer) {
+                    Ok(r) => r,
+                    Err(_) => {
+                        println!("Error reading from stream {:?}", self.stream.peer_addr());
+                        break;
                     }
                 };
 
-                drop(db);
+                if read_bytes == 0 {
+                    break 'outer;
+                }
 
-                match response {
-                    Some(mut r) => {
-                        r.push(b'\r');
-                        r.push(b'\n');
-                        self.stream.write(&r[..]).expect("Failed to write to stream!")
-                    },
-                    None => self.stream.write(b"Error\r\n").expect("Failed to write to stream!"),
+                //println!("read {} bytes", read_bytes);
+
+                if let Some(mut parser) = Parser::from(&buffer[0..read_bytes]) {
+                    if let Some(commands) = parser.parse() {
+                        let mut db = match self.db.lock() {
+                            Ok(db) => db,
+                            Err(_) => {
+                                println!(
+                                    "Poisoned lock on thread connected to {:?}",
+                                    self.stream.peer_addr()
+                                );
+                                break;
+                            }
+                        };
+                        for cmd in commands {
+                            let mut response: Option<Value> = match cmd {
+                                Command::Disconnect => {
+                                    println!(
+                                        "Client {} requesting disconnect",
+                                        self.stream.peer_addr().unwrap()
+                                    );
+                                    self.stream.shutdown(Shutdown::Both).unwrap();
+                                    break 'outer;
+                                }
+                                Command::Create(key, val) => db.create(key, val).map(|v| v.clone()),
+                                Command::Delete(key) => db.delete(&key).map(|v| v.clone()),
+                                Command::Read(key) => db.read(&key).map(|v| v.clone()),
+                                Command::Update(key, val) => {
+                                    match db.update(&key, val).map(|v| v.clone()) {
+                                        Ok(r) => r,
+                                        e => {
+                                            println!(
+                                                "Error writing to stream {:?}",
+                                                self.stream.peer_addr()
+                                            );
+                                            break;
+                                        }
+                                    }
+                                }
+                                Command::Subscribe(key) => {
+                                    db.subscribe(&key, tx.clone());
+                                    None
+                                }
+                            };
+
+                            let result = if let Some(mut r) = response {
+                                if let Err(_) = tx.send(Vec::from(format!("{}", r).as_bytes())) {
+                                    println!(
+                                        "Error writing to stream {:?}",
+                                        self.stream.peer_addr()
+                                    );
+                                    break;
+                                }
+                            };
+                        }
+                        drop(db);
+                    } else {
+                        // if let Err(_) = tx.send(b"Error parsing") {
+                        //             println!("Error writing to stream {:#?}", self.stream.peer_addr());
+                        //             break;
+                        //         }
+                    }
                 };
-            };
-            buffer.clear();
-
-        }
-        println!("dropped connection");
+            }
+            println!("Dropped connection to {:?}", self.stream.peer_addr());
+        });
     }
 }
 
 struct Server {
     db: Arc<Mutex<Database>>,
-
+    listener: TcpListener,
 }
 
-// fn handle(mut stream: TcpStream, db: Arc<Mutex<Database>>) -> io::Result<()> {
-//     Client::run
-//     Ok(())
-// }
+impl Server {
+    pub fn listen<A: ToSocketAddrs>(addr: A) -> Result<(), std::io::Error> {
+        let server = Server {
+            db: Arc::new(Mutex::new(Database::new())),
+            listener: TcpListener::bind(addr)?,
+        };
+        for stream in server.listener.incoming() {
+            match stream {
+                Ok(stream) => Client::spawn(stream, server.db.clone()).run(),
+                Err(e) => {
+                    println!("Error connecting to stream {:?}", e);
+                }
+            }
+        }
+        Ok(())
+    }
+}
 
 fn main() {
-
-    let listener = TcpListener::bind("0.0.0.0:1122").unwrap();
-
-    let db = Arc::new(Mutex::new(Database::new()));
-    for stream in listener.incoming() {
-        let c = db.clone();
-        thread::spawn(move || Client { stream: stream.unwrap(), db: c}.run());
-    }
-
-
-    println!("Hello, world!");
+    println!("kv listening on 1122");
+    Server::listen("0.0.0.0:1122").unwrap();
 }

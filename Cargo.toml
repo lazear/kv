@@ -1,5 +1,5 @@
 [package]
-name = "mq"
+name = "kv"
 version = "0.1.0"
 authors = ["Michael Lazear <lazear@scripps.edu>"]
 
