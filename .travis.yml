@@ -7,6 +7,5 @@ matrix:
     - rust: nightly
 script:
   - cargo build --verbose --all
-  - cargo clippy
 notifications:
   email: false
