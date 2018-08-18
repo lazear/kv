@@ -45,9 +45,8 @@ impl<'a> Lexer<'a> {
 
     fn consume(&mut self) -> Result<char, Error> {
         let next = self.input.next();
-        match next {
-            Some(_) => self.pos += 1,
-            None => (),
+        if next.is_some() {
+            self.pos += 1;
         }
         next.ok_or(Error::UnexpectedEOF)
     }
@@ -104,7 +103,7 @@ impl<'a> Lexer<'a> {
     }
 
     pub fn lex(&mut self) -> Result<Token, Error> {
-        while let Ok(c) = self.peek() {
+        if let Ok(c) = self.peek() {
             match c {
                 '$' => {
                     let _ = self.consume()?;

@@ -1,3 +1,4 @@
+use super::lexer;
 use super::lexer::{Lexer, Token, Token::*};
 use std::collections::VecDeque;
 use std::fmt;
@@ -18,17 +19,7 @@ pub enum Value {
 
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            Value::Text(ref s) => write!(f, "${}\r\n{}\r\n", s.len(), s),
-            Value::Integer(ref i) => write!(f, ":{}\r\n", i),
-            Value::Array(ref array) => write!(f, "*{}\r\n", array.len()).and(
-                array
-                    .iter()
-                    .map(|v| write!(f, "{}", v))
-                    .collect::<fmt::Result>(),
-            ),
-            Null => write!(f, ""),
-        }
+        write!(f, "{}", self.encode())
     }
 }
 
@@ -42,14 +33,24 @@ pub enum Command {
     Subscribe(String),
 }
 
+#[derive(Debug, PartialEq, PartialOrd, Clone)]
+pub enum Error {
+    Expected(String, Token),
+    Terminated,
+    Syntax(lexer::Error),
+    InvalidUTF8,
+}
+
 impl Parser {
-    pub fn from(s: &[u8]) -> Option<Parser> {
-        if let Ok(Token::Array(array)) = Lexer::from(str::from_utf8(s).ok()?).lex() {
-            Some(Parser {
+    pub fn from(s: &[u8]) -> Result<Parser, Error> {
+        match Lexer::from(str::from_utf8(s).map_err(|_| Error::InvalidUTF8)?)
+            .lex()
+            .map_err(Error::Syntax)?
+        {
+            Token::Array(array) => Ok(Parser {
                 tokens: VecDeque::from(array),
-            })
-        } else {
-            None
+            }),
+            t => Err(Error::Expected("token array".into(), t)),
         }
     }
 
@@ -67,20 +68,22 @@ impl Parser {
         }
     }
 
-    fn expect_identifier(&mut self) -> Option<String> {
-        match self.tokens.pop_front()? {
-            Token::Identifier(s) => Some(s),
-            _ => None,
+    fn expect_identifier(&mut self) -> Result<String, Error> {
+        match self.tokens.pop_front() {
+            Some(Token::Identifier(s)) => Ok(s),
+            Some(t) => Err(Error::Expected("identifier".into(), t)),
+            None => Err(Error::Terminated),
         }
     }
 
-    fn pop_front(&mut self) -> Option<Value> {
-        self.tokens
-            .pop_front()
-            .map(|token| self.token_to_value(token))
+    fn pop_front(&mut self) -> Result<Value, Error> {
+        match self.tokens.pop_front() {
+            Some(token) => Ok(self.token_to_value(token)),
+            None => Err(Error::Terminated),
+        }
     }
 
-    pub fn parse(&mut self) -> Option<Vec<Command>> {
+    pub fn parse(&mut self) -> Result<Vec<Command>, Error> {
         let mut cmd = Vec::new();
         while let Some(token) = self.tokens.pop_front() {
             match token {
@@ -99,11 +102,24 @@ impl Parser {
                 Token::Array(array) => {
                     self.tokens.extend(array);
                 }
-                _ => return None,
+                t => return Err(Error::Expected("command or array".into(), t)),
             }
         }
-        println!("Parsed {:?}", cmd);
-        Some(cmd)
+        Ok(cmd)
+    }
+}
+
+impl Value {
+    pub fn encode(&self) -> String {
+        match self {
+            Value::Null => "*0\r\n".to_string(),
+            Value::Text(ref s) => format!("${}\r\n{}\r\n", s.len(), s),
+            Value::Integer(i) => format!(":{}\r\n", i),
+            Value::Array(ref a) => a.iter().fold(format!("*{}\r\n", a.len()), |mut acc, val| {
+                acc.push_str(&val.encode());
+                acc
+            }),
+        }
     }
 }
 
@@ -112,13 +128,25 @@ mod test {
     use super::*;
 
     #[test]
+    fn enocde_array() {
+        let answer = "*2\r\n$4\r\nval1\r\n$4\r\nval2\r\n";
+        assert_eq!(
+            answer,
+            encode(&Value::Array(vec![
+                Value::Text(String::from("val1")),
+                Value::Text(String::from("val2"))
+            ]))
+        );
+    }
+
+    #[test]
     fn parse_array() {
         let mut parser =
             Parser::from(b"*3\r\n$6\r\nCREATE\r\n$3\r\nkey\r\n*2\r\n$4\r\nval1\r\n$4\r\nval2\r\n")
                 .unwrap();
         assert_eq!(
             parser.parse(),
-            Some(vec![Command::Create(
+            Ok(vec![Command::Create(
                 String::from("key"),
                 Value::Array(vec![
                     Value::Text(String::from("val1")),
@@ -129,17 +157,11 @@ mod test {
     }
 
     #[test]
-    fn parse_fail() {
-        let mut parser = Parser::from(b":-100346\r\n");
-        assert_eq!(parser, None);
-    }
-
-    #[test]
     fn parse_cmd() {
         let mut parser = Parser::from(b"*2\r\n$3\r\nSUB\r\n$3\r\nkey\r\n").unwrap();
         assert_eq!(
             parser.parse(),
-            Some(vec![Command::Subscribe(String::from("key"))])
+            Ok(vec![Command::Subscribe(String::from("key"))])
         );
     }
 }
